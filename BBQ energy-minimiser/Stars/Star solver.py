@@ -1,6 +1,15 @@
-"""Author: Adam Smith"""
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+BBQ multi-field thin-shell + axion-flux solver for star density distributions.
+
+This version implements a fast-scan and refine methodology to find the minimum-energy
+surface dilaton value (chi_s). It utilises a conserved-flux approximation for the axion
+field to reduce computational cost during objective evaluations.
+
+Author: Adam Smith
+If this code is used in the creation of published material, please include a citation to the paper: https://arxiv.org/pdf/2603.13986
+"""
 
 import os
 import sys
@@ -8,9 +17,10 @@ import time
 import argparse
 import numpy as np
 
-# -------------------------
-# Matplotlib functions and flags
-# -------------------------
+# ============================================================
+# Matplotlib configuration
+# ============================================================
+
 HEADLESS_FLAG = ("--headless" in sys.argv)
 import matplotlib
 if HEADLESS_FLAG:
@@ -21,55 +31,71 @@ from dataclasses import dataclass
 from scipy.integrate import solve_bvp, cumulative_trapezoid
 from scipy.optimize import minimize_scalar
 
-# numpy trapz compatibility (the ususal stupid shit)
+# -------------------------------------------------
+# NumPy trapz compatibility
+# -------------------------------------------------
 TRAPZ = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
 
-# -------------------------
-# Numerical safety
-# -------------------------
+# ============================================================
+# Numerical safety & formal exceptions
+# ============================================================
+
 EXP_CLIP = 700.0
+
 def exp_safe(x):
+    """Exponent with clipping to avoid overflow/underflow."""
     return np.exp(np.clip(x, -EXP_CLIP, EXP_CLIP))
 
 W2_FLOOR_FACTOR = 10.0
 
-class BBQNoMinimum(RuntimeError): pass
-class BBQSingular(RuntimeError): pass
+class BBQNoMinimum(RuntimeError):
+    """Raised when the analytic chi_s estimate yields no valid real solution."""
+    pass
+
+class BBQSingular(RuntimeError):
+    """Raised when W^2 hits thresholds or floors indicating a singular regime."""
+    pass
+
+
+# ============================================================
+# Environment / Parameters
+# ============================================================
 
 @dataclass
 class Env:
+    """Bundle of physical and numerical parameters for a BBQ solver run."""
     Rs: float = 1.0
     rmin: float = 1e-4
     N: int = 2000
 
-    # density: smoothed truncated polytrope
+    # Density profile: smoothed truncated polytrope
     rho_c: float = 1e-5
     rho_env: float = 1e-12
     ell_rho: float = 1e-3
     n_poly: int = 3
 
-    # model
+    # Scalar model
     beta: float = 0.2
     V0: float = 5e-10
     kappa: float = None
     Mpl: float = 1.0
 
-    # axion kinetic coupling
+    # Axion kinetic coupling
     W0: float = 1.0
     zeta: float = -2.0e10
     W2_floor: float = 1e-300
 
-    # axion BC + window
+    # Axion boundary data and window
     a_minus: float = 0.0
     a_plus: float = 5.0e-9
     ell_a: float = 0.4
     window_centered: bool = False
 
-    # geometry factors
-    ell_S: float = None #smooths the axion gradient turn-on so dilaton doesn't recive instantaneous kick
+    # Geometry factors
+    ell_S: float = None  # Smooths the axion gradient turn-on so the dilaton doesn't receive an instantaneous kick
     Lov: float = None
 
-    # fixed-point loop
+    # Fixed-point loop
     max_iter: int = 60
     damp: float = 0.6
     tol_rel_J: float = 1e-3
@@ -79,78 +105,85 @@ class Env:
     bvp_tol: float = 5e-4
     bvp_max_nodes: int = None
 
-    # chi_s bracket + refine
+    # chi_s bracket and local refine
     chis_bounds_halfwidth: float = 2e-9
     chis_xatol: float = 1e-12
     chis_maxiter: int = 80
     chis_min: float = 0.0
 
-    # scan + candidate selection
+    # Scan and candidate selection
     dense_n: int = 201
     topk_scan: int = 8
     refine_halfwidth_factor: float = 0.25
 
-    # progress control
+    # Progress control
     scan_print_every: int = 1
     refine_print_every: int = 1
 
-    # FAST scan-only env
+    # FAST scan-only environment parameters
     use_fast_scan_refine: bool = True
     N_fast: int = 400
     max_iter_fast: int = 25
     bvp_tol_fast: float = 3e-5
     bvp_max_nodes_factor_fast: int = 50
 
-    # selection behaviour
+    # Selection behaviour
     include_chi_guess_as_candidate: bool = False
     scan_warm_start: bool = True
 
-    # seed behaviour
+    # Seed behaviour
     use_analytic_seed: bool = False
     fallback_chi_guess: float = 0.0
 
-    # flatness detection
+    # Flatness detection
     flat_rel_tol: float = 1e-10
     flat_trim_frac: float = 0.10
     flat_best_band: float = 5e-12
 
-    # sanity cut for "OK but garbage" points
+    # Sanity cut for valid but non-physical points
     L_sanity_max: float = 1e-6
     J_sanity_max: float = 1e-6
 
-    # robust fallback continuation in flux strength (only if needed)
+    # Robust fallback continuation in flux strength
     use_flux_continuation_on_fail: bool = True
     flux_scales: tuple = (0.25, 0.5, 0.8, 1.0)
 
     def __post_init__(self):
+        """Populate derived defaults."""
         if self.kappa is None:
-            self.kappa = 4*self.beta - 1.0
+            self.kappa = 4 * self.beta - 1.0
         if self.Lov is None:
             self.Lov = self.ell_a
         if self.ell_S is None:
             dr = (self.Rs - self.rmin) / (self.N - 1)
-            self.ell_S = 1.0*dr
+            self.ell_S = 1.0 * dr
         if self.bvp_max_nodes is None:
             self.bvp_max_nodes = 50 * self.N
 
 def _recompute_ellS(env: Env):
+    """Recompute the smoothing length scale based on the spatial grid."""
     dr = (env.Rs - env.rmin) / (env.N - 1)
     env.ell_S = 1.0 * dr
 
 def make_fast_env(env_full: Env) -> Env:
+    """Create a lower-resolution environment for rapid scanning."""
     envf = Env(**vars(env_full))
     envf.N = int(env_full.N_fast)
     envf.max_iter = int(env_full.max_iter_fast)
     envf.bvp_tol = float(env_full.bvp_tol_fast)
     envf.bvp_max_nodes = int(env_full.bvp_max_nodes_factor_fast * envf.N)
-    envf.tol_abs_chi = max(env_full.tol_abs_chi, 10.0*env_full.tol_abs_chi)
-    envf.tol_rel_J   = max(env_full.tol_rel_J,   10.0*env_full.tol_rel_J)
+    envf.tol_abs_chi = max(env_full.tol_abs_chi, 10.0 * env_full.tol_abs_chi)
+    envf.tol_rel_J   = max(env_full.tol_rel_J,   10.0 * env_full.tol_rel_J)
     _recompute_ellS(envf)
     return envf
 
-# ---------------- density ----------------
-#star density
+
+# ============================================================
+# Density profile
+# ============================================================
+
 def rho_poly_truncated(r, env: Env):
+    """Truncated polytropic stellar density profile."""
     r = np.asarray(r, dtype=float)
     rho = np.empty_like(r)
     inside = r <= env.Rs
@@ -159,8 +192,8 @@ def rho_poly_truncated(r, env: Env):
     rho[~inside] = env.rho_env
     return rho
 
-#total density
 def rho_of_r(r, env: Env):
+    """Smoothly truncated density profile applying a tanh envelope."""
     r = np.asarray(r, dtype=float)
     if env.ell_rho <= 0:
         return rho_poly_truncated(r, env)
@@ -169,65 +202,101 @@ def rho_of_r(r, env: Env):
     rho_in = rho_poly_truncated(r, env)
     return env.rho_env + (rho_in - env.rho_env) * s
 
-#computes surface newtonian potential (not used for computations)
 def Phi_surface_from_density(env: Env, use_reduced_planck=True):
+    """Compute the surface Newtonian potential (used for analytic estimates)."""
     r = np.linspace(0.0, env.Rs, 200000)
     rho = rho_poly_truncated(r, env)
-    M = 4*np.pi * TRAPZ(rho * r**2, r)
-    G = (1.0/(8*np.pi)) if use_reduced_planck else 1.0
+    M = 4 * np.pi * TRAPZ(rho * r**2, r)
+    G = (1.0 / (8 * np.pi)) if use_reduced_planck else 1.0
     return float(G * M / env.Rs)
 
-# ---------------- model ----------------
-def Vchi(chi, env): return env.kappa * env.V0 * exp_safe(env.kappa*chi)
-def V_of_chi(chi, env): return env.V0 * exp_safe(env.kappa*chi)
+
+# ============================================================
+# Model functions
+# ============================================================
+
+def Vchi(chi, env): 
+    """Potential derivative V_,chi for V = V0 exp(kappa chi)."""
+    return env.kappa * env.V0 * exp_safe(env.kappa * chi)
+
+def V_of_chi(chi, env): 
+    """Potential V(chi) = V0 exp(kappa chi)."""
+    return env.V0 * exp_safe(env.kappa * chi)
 
 def Achi_rho(chi, r, env):
-    return env.beta * rho_of_r(r, env) * exp_safe(env.beta*chi)
+    """Matter source term beta rho(r) exp(beta chi)."""
+    return env.beta * rho_of_r(r, env) * exp_safe(env.beta * chi)
 
-def A_of_chi(chi, env): return exp_safe(env.beta*chi)
+def A_of_chi(chi, env): 
+    """Conformal factor A(chi) = exp(beta chi)."""
+    return exp_safe(env.beta * chi)
 
-def logW2(chi, env): return np.log(env.W0**2) + 2.0*env.zeta*chi/env.Mpl
-def W2_raw(chi, env): return (env.W0**2) * exp_safe(2.0*env.zeta*chi/env.Mpl)
-def W2_eff(chi, env): return np.maximum(W2_raw(chi, env), env.W2_floor)
+def logW2(chi, env): 
+    """log(W^2) for diagnostics."""
+    return np.log(env.W0**2) + 2.0 * env.zeta * chi / env.Mpl
 
-# ---------------- window ----------------
-#smotting windo to make sure the axion gradient isn't singular
+def W2_raw(chi, env): 
+    """Raw W^2 without flooring."""
+    return (env.W0**2) * exp_safe(2.0 * env.zeta * chi / env.Mpl)
+
+def W2_eff(chi, env): 
+    """Effective W^2 with a hard floor for numerical stability."""
+    return np.maximum(W2_raw(chi, env), env.W2_floor)
+
+
+# ============================================================
+# Smooth axion window
+# ============================================================
+
 def window_edges(env):
+    """Return the inner and outer edges of the axion window."""
     if env.window_centered:
-        r1 = env.Rs - 0.3*env.ell_a
-        r2 = env.Rs + 0.3*env.ell_a
+        r1 = env.Rs - 0.3 * env.ell_a
+        r2 = env.Rs + 0.3 * env.ell_a
     else:
         r1 = env.Rs - env.ell_a
         r2 = env.Rs
     return r1, r2
 
 def S_window_smooth(r, env):
+    """Smooth top-hat window S(r) with tanh edges to ensure non-singular gradients."""
     r = np.asarray(r, dtype=float)
     r1, r2 = window_edges(env)
     ellS = env.ell_S
-    return 0.5*(np.tanh((r - r1)/ellS) - np.tanh((r - r2)/ellS))
+    return 0.5 * (np.tanh((r - r1) / ellS) - np.tanh((r - r2) / ellS))
 
-# ---------------- flux + a' ----------------
+
+# ============================================================
+# Flux J and axion gradients a'(r)
+# ============================================================
+
 def compute_flux_J(r, chi, env):
+    """Compute flux J enforcing the total axion jump across the window."""
     S = S_window_smooth(r, env)
     rr = np.maximum(r, env.rmin)
-    denom = TRAPZ(S / (rr*rr*W2_eff(chi, env)), r)
+    denom = TRAPZ(S / (rr * rr * W2_eff(chi, env)), r)
     Da = env.a_plus - env.a_minus
     if denom <= 0 or (not np.isfinite(denom)):
         raise RuntimeError(f"Bad flux denominator: denom={denom}")
     return Da / denom
 
 def aprime_from_J(r, chi, env, J):
+    """Compute a'(r) from the conserved flux J and the current dilaton profile."""
     S = S_window_smooth(r, env)
     rr = np.maximum(r, env.rmin)
-    return J * S / (rr*rr*W2_eff(chi, env))
+    return J * S / (rr * rr * W2_eff(chi, env))
 
-# ---------------- checks (FIXED) ----------------
+
+# ============================================================
+# Singularity / floor checks
+# ============================================================
+
 def _min_allowed_W2(env: Env):
-    # The only *hard* criterion we enforce is "not floor dominated"
+    """Threshold at which W2 is deemed entirely floor-dominated."""
     return W2_FLOOR_FACTOR * float(env.W2_floor)
 
 def check_surface_W2(env, chi_s):
+    """Abort if W^2 at the surface is floor-dominated."""
     W2_s = float(W2_raw(chi_s, env))
     minW2 = _min_allowed_W2(env)
     if (not np.isfinite(W2_s)) or (W2_s < minW2):
@@ -238,6 +307,7 @@ def check_surface_W2(env, chi_s):
     return float(logW2(chi_s, env)), W2_s
 
 def check_ramp_W2(env, r, chi):
+    """Abort if W^2 becomes too small inside the active axion window."""
     S = S_window_smooth(r, env)
     mask = S > 1e-6
     if not np.any(mask):
@@ -249,19 +319,38 @@ def check_ramp_W2(env, r, chi):
             f"[STOP] Ramp W2 floor-dominated: min W2 in ramp={W2m:.3e}, min_allowed={minW2:.3e}"
         )
 
-# ---------------- backreaction ----------------
-#axion term in dilaton EoM
+
+# ============================================================
+# Axion backreaction term
+# ============================================================
+
 def axion_backreaction(rr, chi, env, J):
+    """Axion kinetic contribution to the dilaton equation of motion."""
     S = S_window_smooth(rr, env)
     rr_eff = np.maximum(rr, env.rmin)
-    return (env.zeta/env.Mpl) * (J*J) * (S*S) / (rr_eff**4 * W2_eff(chi, env))
+    return (env.zeta / env.Mpl) * (J * J) * (S * S) / (rr_eff**4 * W2_eff(chi, env))
 
-# ---------------- BVP ----------------
+
+# ============================================================
+# Dilaton BVP Solver
+# ============================================================
+
 def solve_chi_bvp_given_J_and_chis(r, J, env, chi_guess, chi_s):
+    """
+    Solve the dilaton BVP at fixed flux (J) and surface value (chi_s).
+    
+    Equations:
+        chi' = L/r^2
+        L'   = r^2 [Vchi + Achi_rho + axion]
+
+    Boundary conditions:
+        L(rmin) = 0
+        chi(Rs) = chi_s
+    """
     check_surface_W2(env, chi_s)
     chi0 = np.array(chi_guess, copy=True)
     chip0 = np.gradient(chi0, r, edge_order=2)
-    u0 = (r*r) * chip0
+    u0 = (r * r) * chip0
     u0[0] = 0.0
     y0 = np.vstack((chi0, u0))
 
@@ -269,8 +358,8 @@ def solve_chi_bvp_given_J_and_chis(r, J, env, chi_guess, chi_s):
         chi = y[0]
         u   = y[1]
         rr_eff = np.maximum(rr, env.rmin)
-        dchi = u / (rr_eff*rr_eff)
-        du   = (rr_eff*rr_eff) * (Vchi(chi, env) + Achi_rho(chi, rr_eff, env)
+        dchi = u / (rr_eff * rr_eff)
+        du   = (rr_eff * rr_eff) * (Vchi(chi, env) + Achi_rho(chi, rr_eff, env)
                                   + axion_backreaction(rr_eff, chi, env, J))
         return np.vstack((dchi, du))
 
@@ -289,11 +378,24 @@ def solve_chi_bvp_given_J_and_chis(r, J, env, chi_guess, chi_s):
     chi  = sol.sol(r)[0]
     u    = sol.sol(r)[1]
     rr_eff = np.maximum(r, env.rmin)
-    chip = u / (rr_eff*rr_eff)
+    chip = u / (rr_eff * rr_eff)
     return chi, chip, u
 
-# ---------------- fixed-point (base) ----------------
+
+# ============================================================
+# Fixed-point iteration loop
+# ============================================================
+
 def solve_flux_given_chis(env, chi_s, chi_init=None, J_init=None, do_print=False):
+    """
+    Solve the coupled system iteratively for a fixed chi_s.
+    
+    Iteration:
+        1. Solve dilaton BVP at fixed J
+        2. Update J based on the new dilaton profile
+        3. Apply damping
+        4. Repeat until both J and chi converge
+    """
     r = np.linspace(env.rmin, env.Rs, env.N)
 
     if chi_init is None:
@@ -321,8 +423,8 @@ def solve_flux_given_chis(env, chi_s, chi_init=None, J_init=None, do_print=False
         )
         J_new = compute_flux_J(r, chi_new, env)
 
-        J   = (1-env.damp)*J_old   + env.damp*J_new
-        chi = (1-env.damp)*chi_old + env.damp*chi_new
+        J   = (1 - env.damp) * J_old   + env.damp * J_new
+        chi = (1 - env.damp) * chi_old + env.damp * chi_new
 
         dJ_rel   = abs(J_new - J_old) / max(abs(J_new), abs(J_old), 1e-300)
         dchi_abs = float(np.max(np.abs(chi_new - chi_old)))
@@ -351,24 +453,30 @@ def solve_flux_given_chis(env, chi_s, chi_init=None, J_init=None, do_print=False
     L = float(u[-1])
     return r, chi, chip, a, ap, J, L
 
-# ---------------- robust wrapper ----------------
 def solve_flux_given_chis_robust(env, chi_s, chi_init=None, J_init=None, do_print=False):
+    """
+    Robust wrapper for the fixed-point solver. Applies continuation in flux 
+    strength if the standard direct solve fails.
+    """
     try:
         return solve_flux_given_chis(env, chi_s, chi_init=chi_init, J_init=J_init, do_print=do_print)
     except Exception as first_err:
         if not env.use_flux_continuation_on_fail:
             raise
-        # continuation in Delta a, warm-start each stage
+        
+        # Continuation in delta_a, applying warm-starts at each intermediate stage
         Da_full = float(env.a_plus - env.a_minus)
         aplus_full = float(env.a_plus)
         chi_state = chi_init
         J_state = J_init
         last_err = first_err
+        
         for s in env.flux_scales:
             try:
-                env.a_plus = env.a_minus + s*Da_full
+                env.a_plus = env.a_minus + s * Da_full
                 out = solve_flux_given_chis(env, chi_s, chi_init=chi_state, J_init=J_state, do_print=False)
-                # warm starts for next stage
+                
+                # Warm starts for next scaling stage
                 r, chi, chip, a, ap, J, L = out
                 chi_state, J_state = chi, J
                 last_out = out
@@ -376,14 +484,23 @@ def solve_flux_given_chis_robust(env, chi_s, chi_init=None, J_init=None, do_prin
             except Exception as e:
                 last_err = e
                 break
+                
         env.a_plus = aplus_full
         if last_err is not None:
-            raise RuntimeError(f"robust solve failed (after continuation): {last_err}") from last_err
-        # final stage already used full scale=1.0 and restored a_plus; return last_out
+            raise RuntimeError(f"Robust solve failed (after continuation): {last_err}") from last_err
+            
         return last_out
 
-# ---------------- energy ----------------
+
+# ============================================================
+# Total system energy
+# ============================================================
+
 def total_energy_from_profiles(r, chi, chip, ap, rho, env, L):
+    """
+    Compute the total energy of the physical configuration. Includes the 
+    internal integration as well as the exterior gradient piece.
+    """
     W2 = W2_raw(chi, env)
     S = S_window_smooth(r, env)
     mask = S > 1e-6
@@ -394,24 +511,30 @@ def total_energy_from_profiles(r, chi, chip, ap, rho, env, L):
                 f"min_allowed={_min_allowed_W2(env):.3e}"
             )
 
-    integrand = 0.5*chip**2 + 0.5*W2*ap**2 + V_of_chi(chi, env) + A_of_chi(chi, env)*rho
-    Ein = 4*np.pi * TRAPZ(r*r*integrand, r)
-    Eout_grad = 2*np.pi * (L*L) / env.Rs
+    integrand = 0.5 * chip**2 + 0.5 * W2 * ap**2 + V_of_chi(chi, env) + A_of_chi(chi, env) * rho
+    Ein = 4 * np.pi * TRAPZ(r * r * integrand, r)
+    Eout_grad = 2 * np.pi * (L * L) / env.Rs
     return float(Ein + Eout_grad)
 
-# ---------------- seed ----------------
+
+# ============================================================
+# Analytic seed generation
+# ============================================================
+
 def chi_surface_from_eq_analytic(env):
+    """Provide an analytic estimate for the minimum-energy chi_s."""
     PhiN = Phi_surface_from_density(env, use_reduced_planck=True)
     Da = env.a_plus - env.a_minus
     pref = (env.ell_a**2) / (env.Rs * env.Lov) * (env.Mpl**2 / (Da**2 + 1e-300))
-    denom = (2.0 * env.zeta**2) * (4.0*env.zeta*env.beta*PhiN + 1.0) * (env.W0**2)
+    denom = (2.0 * env.zeta**2) * (4.0 * env.zeta * env.beta * PhiN + 1.0) * (env.W0**2)
     arg = - pref / denom
     if (not np.isfinite(arg)) or (arg <= 0.0):
         raise BBQNoMinimum(f"eq_analytic: no real chi_s (arg={arg:.3e}).")
-    chi_s = (env.Mpl/(2.0*env.zeta)) * np.log(arg)
+    chi_s = (env.Mpl / (2.0 * env.zeta)) * np.log(arg)
     return float(chi_s)
 
 def get_initial_chi_guess(env: Env):
+    """Retrieve the starting guess for the dilaton surface value."""
     chi_eq_analytic = None
     if env.use_analytic_seed:
         try:
@@ -422,8 +545,13 @@ def get_initial_chi_guess(env: Env):
         return float(chi_eq_analytic), float(chi_eq_analytic)
     return float(env.fallback_chi_guess), chi_eq_analytic
 
-# ---------------- scan machinery ----------------
+
+# ============================================================
+# Scanning and candidate selection
+# ============================================================
+
 def _center_out_order(n, i0):
+    """Yield indices radiating outward from the specified centre."""
     order = [i0]
     for k in range(1, n):
         j1 = i0 + k
@@ -434,12 +562,16 @@ def _center_out_order(n, i0):
     return order[:n]
 
 def scan_energy_over_bounds(env, bounds, n_scan=201, center=None, do_print=True):
+    """
+    Perform a coarse sweep over chi_s, tracking successful convergence 
+    and returning the energy landscape.
+    """
     chi_grid = np.linspace(bounds[0], bounds[1], int(n_scan))
     E = np.full_like(chi_grid, np.nan, dtype=float)
     ok = np.zeros_like(chi_grid, dtype=bool)
 
     if center is None:
-        center = 0.5*(bounds[0] + bounds[1])
+        center = 0.5 * (bounds[0] + bounds[1])
     i0 = int(np.argmin(np.abs(chi_grid - center)))
     order = _center_out_order(len(chi_grid), i0)
 
@@ -479,6 +611,7 @@ def scan_energy_over_bounds(env, bounds, n_scan=201, center=None, do_print=True)
     return chi_grid, E, ok
 
 def build_candidates_from_full_grid(chi_grid, E_grid, ok, topk=8, include_center_idx=None):
+    """Locate local minima within the successful scan points to serve as refine candidates."""
     valid = np.where(ok)[0]
     if valid.size == 0:
         return []
@@ -488,9 +621,9 @@ def build_candidates_from_full_grid(chi_grid, E_grid, ok, topk=8, include_center
     valid_set = set(map(int, valid))
     for i in valid:
         i = int(i)
-        if (i-1 in valid_set) and (i+1 in valid_set):
-            if np.isfinite(E_grid[i-1]) and np.isfinite(E_grid[i]) and np.isfinite(E_grid[i+1]):
-                if (E_grid[i] < E_grid[i-1]) and (E_grid[i] < E_grid[i+1]):
+        if (i - 1 in valid_set) and (i + 1 in valid_set):
+            if np.isfinite(E_grid[i - 1]) and np.isfinite(E_grid[i]) and np.isfinite(E_grid[i + 1]):
+                if (E_grid[i] < E_grid[i - 1]) and (E_grid[i] < E_grid[i + 1]):
                     cand.add(i)
 
     k = int(min(topk, valid.size))
@@ -505,6 +638,7 @@ def build_candidates_from_full_grid(chi_grid, E_grid, ok, topk=8, include_center
     return cand
 
 def _trimmed_minmax(arr, trim_frac):
+    """Helper returning robust bounds ignoring potential extreme outliers."""
     a = np.array(arr, dtype=float)
     a = a[np.isfinite(a)]
     if a.size == 0:
@@ -512,19 +646,27 @@ def _trimmed_minmax(arr, trim_frac):
     a.sort()
     m = a.size
     k = int(np.floor(trim_frac * m))
-    if (m > 2*k) and (k > 0):
+    if (m > 2 * k) and (k > 0):
         a = a[k:-k]
     return float(np.min(a)), float(np.max(a)), a
 
 def _is_sane_solution(J, L, env: Env):
+    """Filter out converged states that exhibit spurious numerical artifacts."""
     if not np.isfinite(J) or not np.isfinite(L): return False
     if abs(L) > env.L_sanity_max: return False
     if abs(J) > env.J_sanity_max: return False
     return True
 
-# ---------------- refine ----------------
-#refining around best found chi_s from output
+
+# ============================================================
+# Local refinement
+# ============================================================
+
 def refine_around_candidate_FULL(env_full, bounds0, chi0, scan_dx=None, do_print=True):
+    """
+    Perform a bounded 1D minimisation around the candidate using the 
+    high-resolution (FULL) solver. Returns the optimal chi_s and profiles.
+    """
     half_ref_global = env_full.refine_halfwidth_factor * env_full.chis_bounds_halfwidth
     if (scan_dx is not None) and np.isfinite(scan_dx) and (scan_dx > 0):
         half_ref_local = 8.0 * float(scan_dx)
@@ -590,10 +732,19 @@ def refine_around_candidate_FULL(env_full, bounds0, chi0, scan_dx=None, do_print
     sol = (r, chi, chip, a, ap, J, L, float(E_full))
     return chi_star, sol, eval_log
 
-# ---------------- global selection ----------------
-"""energy calculation is unstable for certain chi_s, 
-need to find minimum then do lots of checks to make sure its not a garbage point"""
+
+# ============================================================
+# Global selection pipeline
+# ============================================================
+
 def find_best_chis(env_full, chi_guess, do_print=True):
+    """
+    Global search procedure executing the complete minimum-finding pipeline:
+    1. Scan across parameter space (using fast environment if enabled)
+    2. Extract local minima candidates
+    3. Refine each candidate with the high-resolution objective
+    4. Select the true minimum energy configuration.
+    """
     lo = chi_guess - env_full.chis_bounds_halfwidth
     hi = chi_guess + env_full.chis_bounds_halfwidth
     if env_full.chis_min is not None:
@@ -659,6 +810,11 @@ def find_best_chis(env_full, chi_guess, do_print=True):
 
     return best[1], best[2], bounds0, all_eval_logs, chi_grid, E_grid, ok, relspan_trim
 
+
+# ============================================================
+# Main execution
+# ============================================================
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ell-a", type=float, default=None, help="override ell_a")
@@ -672,7 +828,7 @@ def main():
     env = Env()
     if args.ell_a is not None:
         env.ell_a = float(args.ell_a)
-        env.Lov = env.ell_a  # keep your convention
+        env.Lov = env.ell_a
 
     if args.quick:
         env.N = 300
@@ -715,7 +871,6 @@ def main():
     np.savetxt(profiles_file, data, fmt="%.12e", header="r  chi  chi_prime  a  a_prime  rho  W")
     print("Saved:", os.path.abspath(profiles_file))
 
-    # save dense scan
     dense_file = os.path.join(outdir, "dense_scan.txt")
     with open(dense_file, "w") as f:
         f.write("# chi_s   E_scan   ok(1/0)\n")
@@ -727,7 +882,6 @@ def main():
                 f.write(f"{x:.12e} NaN {ok_i:d}\n")
     print("Saved:", os.path.abspath(dense_file))
 
-    # summary
     summ_file = os.path.join(outdir, "summary.txt")
     with open(summ_file, "w") as f:
         f.write(f"ell_a = {env.ell_a:.12e}\n")
@@ -742,7 +896,6 @@ def main():
         f.write(f"W2_min_allowed = {_min_allowed_W2(env):.12e}\n")
     print("Saved:", os.path.abspath(summ_file))
 
-    # Objective-eval log
     obj_file = os.path.join(outdir, "objective_evals_full.txt")
     with open(obj_file, "w") as f:
         f.write("# chi_s   E_full   ok(1/0)   sane(1/0)   J   L   err\n")
@@ -761,12 +914,10 @@ def main():
                     f.write(f"{x:.12e} NaN {ok_i:d} {sane_i:d} NaN NaN {err}\n")
     print("Saved:", os.path.abspath(obj_file))
 
-    # ---- plotting: save PDFs AND (optionally) show windows ----
     do_plots = (not args.no_plots)
     do_show  = do_plots and (not args.no_show) and (not args.headless)
 
     if do_plots:
-        # Dense scan diagnostic plot
         scan_file = os.path.join(outdir, "scan_energy.pdf")
         fig_scan, ax_scan = plt.subplots(1, 1, figsize=(8, 4))
         msk = np.asarray(ok_scan, dtype=bool) & np.isfinite(E_grid)
@@ -783,7 +934,6 @@ def main():
         if not do_show:
             plt.close(fig_scan)
 
-        # Profiles plot
         prof_file = os.path.join(outdir, "profiles.pdf")
         fig_prof, ax = plt.subplots(4, 1, figsize=(9, 11), sharex=True)
 

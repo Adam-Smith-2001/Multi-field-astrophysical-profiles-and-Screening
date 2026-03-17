@@ -12,6 +12,8 @@ Checks on the solver mesh sol.x:
     (1)  chi'(r) ?= L(r) / r^2
     (2)  L'(r)   ?= r^2 [ V_,chi + beta rho e^{beta chi} + axion ]
     (3)  BCs: L(rmin)=0, chi(Rs)=chi_s
+    
+If this code is used in the creation of published material, please include a citation to the paper: https://arxiv.org/pdf/2603.13986
 """
 
 from __future__ import annotations
